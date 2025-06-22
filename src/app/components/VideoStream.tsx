@@ -22,6 +22,8 @@ export default function VideoStream({
     const mediaRecorderRef = useRef<MediaRecorder | null>(null)
     const streamRef = useRef<MediaStream | null>(null)
     const frameCountRef = useRef<number>(0)
+    const lastVideoTimeRef = useRef<number>(0)
+    const lastFrameHashRef = useRef<string>('')
 
     const [error, setError] = useState<string | null>(null)
     const [badPostureStart, setBadPostureStart] = useState<Date | null>(null)
@@ -42,6 +44,35 @@ export default function VideoStream({
             if (videoRef.current) {
                 videoRef.current.srcObject = stream
                 streamRef.current = stream
+
+                // Add event listeners to handle video playback
+                const video = videoRef.current
+
+                // Ensure video plays when loaded
+                video.addEventListener('loadedmetadata', () => {
+                    console.log('Video metadata loaded, starting playback')
+                    video.play().catch(console.error)
+                })
+
+                // Restart video if it gets paused unexpectedly
+                video.addEventListener('pause', () => {
+                    console.log('Video paused unexpectedly, restarting...')
+                    setTimeout(() => {
+                        if (video && !video.ended) {
+                            video.play().catch(console.error)
+                        }
+                    }, 100)
+                })
+
+                // Log when video ends (shouldn't happen with webcam)
+                video.addEventListener('ended', () => {
+                    console.log('Video ended - this should not happen with webcam')
+                })
+
+                // Ensure video starts playing
+                await video.play()
+                console.log('Camera started and video playing')
+
                 setIsRecording(true)
             }
         } catch (err) {
@@ -86,8 +117,28 @@ export default function VideoStream({
             return null
         }
 
+        // Check if video is paused and restart it
+        if (video.paused) {
+            console.log('Video is paused, attempting to restart...')
+            try {
+                await video.play()
+                console.log('Video restarted successfully')
+            } catch (error) {
+                console.error('Failed to restart video:', error)
+                return null
+            }
+        }
+
+        // Check if video time has advanced (this is the key fix!)
+        const currentVideoTime = video.currentTime
+        if (currentVideoTime === lastVideoTimeRef.current && !video.paused) {
+            console.log('Video time unchanged, skipping frame capture. Time:', currentVideoTime)
+            return null
+        }
+
         // Log current video time to see if it's advancing
-        console.log('Video currentTime:', video.currentTime, 'paused:', video.paused)
+        console.log('Video currentTime:', currentVideoTime, 'paused:', video.paused, 'last time:', lastVideoTimeRef.current)
+        lastVideoTimeRef.current = currentVideoTime
 
         canvas.width = video.videoWidth
         canvas.height = video.videoHeight
@@ -96,7 +147,7 @@ export default function VideoStream({
         return new Promise<Blob | null>((resolve) => {
             canvas.toBlob((blob) => {
                 if (blob) {
-                    console.log('Frame captured, size:', blob.size, 'bytes')
+                    console.log('Frame captured, size:', blob.size, 'bytes', 'time:', currentVideoTime.toFixed(3))
                 } else {
                     console.log('Failed to create blob from canvas')
                 }
@@ -312,16 +363,46 @@ export default function VideoStream({
         mediaRecorderRef.current = null
     }, [])
 
+    // Video health check - ensure video stays playing
+    useEffect(() => {
+        if (!isRecording || !videoRef.current) return
+
+        const healthCheck = setInterval(() => {
+            const video = videoRef.current
+            if (!video) return
+
+            // Check if video is paused or stalled
+            if (video.paused && video.readyState >= 2) {
+                console.log('Health check: Video is paused, restarting...')
+                video.play().catch(console.error)
+            }
+
+            // Check if video time is advancing (should change every second)
+            const currentTime = video.currentTime
+            if (currentTime === lastVideoTimeRef.current) {
+                // Video might be stalled, try to restart
+                console.log('Health check: Video may be stalled, attempting restart...')
+                video.play().catch(console.error)
+            }
+        }, 2000) // Check every 2 seconds
+
+        return () => clearInterval(healthCheck)
+    }, [isRecording])
+
     // Main analysis loop
     useEffect(() => {
         if (!isRecording) return
 
         const interval = setInterval(async () => {
             const frameBlob = await captureFrame()
-            if (!frameBlob) return
-            console.log('Frame captured')
+            if (!frameBlob) {
+                // No new frame available, just continue loop
+                return
+            }
 
-            // Increment frame counter
+            console.log('New frame captured, sending to backend')
+
+            // Increment frame counter only for actual captured frames
             const currentFrame = frameCountRef.current + 1
             frameCountRef.current = currentFrame
 
@@ -363,7 +444,7 @@ export default function VideoStream({
                 console.log('Image analysis result:', imageResult)
                 setLastImageAnalysis(new Date())
             }
-        }, 42) // Analyze at ~24fps (1000ms / 24fps ≈ 42ms)
+        }, 42) // Check for new frames at ~24fps (1000ms / 24fps ≈ 42ms)
 
         return () => clearInterval(interval)
     }, [isRecording, captureFrame, sendFrameToBackend, fetchCurrentPosture, analyzeImage, badPostureStart, startIncidentRecording, stopIncidentRecording])
